@@ -35,11 +35,21 @@ export class EDAAppStack extends cdk.Stack {
       tableName: "Images",
     });
 
-    // SQS queues
-    const imageProcessQueue = new sqs.Queue(this, "img-process-q", {
+    // Dead-letter queue
+    const dlq = new sqs.Queue(this, "img-dlq", {
       receiveMessageWaitTime: cdk.Duration.seconds(6),
     });
 
+    // Image processing queue with DLQ
+    const imageProcessQueue = new sqs.Queue(this, "img-process-q", {
+      receiveMessageWaitTime: cdk.Duration.seconds(6),
+      deadLetterQueue: {
+        queue: dlq,
+        maxReceiveCount: 1,
+      },
+    });
+
+    // Mailer queue
     const mailerQ = new sqs.Queue(this, "mailer-q", {
       receiveMessageWaitTime: cdk.Duration.seconds(6),
     });
@@ -49,7 +59,7 @@ export class EDAAppStack extends cdk.Stack {
       displayName: "New Image topic",
     });
 
-    // Lambda for saving image details to DynamoDB
+    // Image persistence Lambda
     const persistImageDataFn = new lambdanode.NodejsFunction(
       this,
       "PersistImageDataFn",
@@ -66,7 +76,7 @@ export class EDAAppStack extends cdk.Stack {
       }
     );
 
-    // Lambda for sending email notifications
+    // Mailer Lambda
     const mailerFn = new lambdanode.NodejsFunction(this, "mailer", {
       runtime: lambda.Runtime.NODEJS_22_X,
       memorySize: 1024,
@@ -74,23 +84,35 @@ export class EDAAppStack extends cdk.Stack {
       entry: `${__dirname}/../lambdas/mailer.ts`,
     });
 
+    // Rejected file Lambda
+    const rejectedFileFn = new lambdanode.NodejsFunction(
+      this,
+      "RejectedFileFn",
+      {
+        runtime: lambda.Runtime.NODEJS_22_X,
+        entry: `${__dirname}/../lambdas/rejectedFile.ts`,
+        timeout: cdk.Duration.seconds(15),
+        memorySize: 128,
+      }
+    );
+
     // S3 --> SNS
     imagesBucket.addEventNotification(
       s3.EventType.OBJECT_CREATED,
       new s3n.SnsDestination(newImageTopic)
     );
 
-    // SNS --> Image processing SQS queue
+    // SNS --> Image processing queue
     newImageTopic.addSubscription(
       new subs.SqsSubscription(imageProcessQueue)
     );
 
-    // SNS --> Mailer SQS queue
+    // SNS --> Mailer queue
     newImageTopic.addSubscription(
       new subs.SqsSubscription(mailerQ)
     );
 
-    // Image processing SQS --> DynamoDB Lambda
+    // Image processing queue --> Persistence Lambda
     persistImageDataFn.addEventSource(
       new events.SqsEventSource(imageProcessQueue, {
         batchSize: 5,
@@ -98,7 +120,7 @@ export class EDAAppStack extends cdk.Stack {
       })
     );
 
-    // Mailer SQS --> Mailer Lambda
+    // Mailer queue --> Mailer Lambda
     mailerFn.addEventSource(
       new events.SqsEventSource(mailerQ, {
         batchSize: 5,
@@ -106,11 +128,19 @@ export class EDAAppStack extends cdk.Stack {
       })
     );
 
+    // DLQ --> Rejected file Lambda
+    rejectedFileFn.addEventSource(
+      new events.SqsEventSource(dlq, {
+        batchSize: 5,
+        maxBatchingWindow: cdk.Duration.seconds(10),
+      })
+    );
+
     // Permissions for image persistence
     imagesBucket.grantRead(persistImageDataFn);
     imagesTable.grantReadWriteData(persistImageDataFn);
 
-    // Permissions for sending SES emails
+    // Permissions for sending email
     mailerFn.addToRolePolicy(
       new iam.PolicyStatement({
         effect: iam.Effect.ALLOW,

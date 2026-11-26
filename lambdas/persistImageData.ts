@@ -25,6 +25,18 @@ export const handler: SQSHandler = async (event) => {
           s3e.object.key.replace(/\+/g, " ")
         );
 
+        // Check that the file has a supported image extension
+        const extensionMatch = srcKey.match(/\.([^.]*)$/);
+        const fileExtension = extensionMatch
+          ? extensionMatch[1].toLowerCase()
+          : "";
+
+        if (!["jpeg", "jpg", "png"].includes(fileExtension)) {
+          console.log("Invalid image file type:", srcKey);
+          throw new Error(`Unsupported file type: ${srcKey}`);
+        }
+
+        // Save valid image filename to DynamoDB
         try {
           await ddbDocClient.send(
             new PutCommand({
@@ -38,6 +50,7 @@ export const handler: SQSHandler = async (event) => {
           console.log("Saved image to DynamoDB:", srcKey);
         } catch (error) {
           console.log("DynamoDB error:", error);
+          throw error;
         }
       }
     }
