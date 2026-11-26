@@ -9,6 +9,7 @@ import * as sqs from "aws-cdk-lib/aws-sqs";
 import * as sns from "aws-cdk-lib/aws-sns";
 import * as subs from "aws-cdk-lib/aws-sns-subscriptions";
 import * as iam from "aws-cdk-lib/aws-iam";
+import * as dynamodb from "aws-cdk-lib/aws-dynamodb";
 
 import { Construct } from "constructs";
 
@@ -23,7 +24,18 @@ export class EDAAppStack extends cdk.Stack {
       publicReadAccess: false,
     });
 
-    // Integration infrastructure
+    // DynamoDB Images table
+    const imagesTable = new dynamodb.Table(this, "ImagesTable", {
+      billingMode: dynamodb.BillingMode.PAY_PER_REQUEST,
+      partitionKey: {
+        name: "name",
+        type: dynamodb.AttributeType.STRING,
+      },
+      removalPolicy: cdk.RemovalPolicy.DESTROY,
+      tableName: "Images",
+    });
+
+    // SQS queues
     const imageProcessQueue = new sqs.Queue(this, "img-process-q", {
       receiveMessageWaitTime: cdk.Duration.seconds(6),
     });
@@ -32,22 +44,29 @@ export class EDAAppStack extends cdk.Stack {
       receiveMessageWaitTime: cdk.Duration.seconds(6),
     });
 
+    // SNS topic
     const newImageTopic = new sns.Topic(this, "NewImageTopic", {
       displayName: "New Image topic",
     });
 
-    // Lambda functions
-    const processImageFn = new lambdanode.NodejsFunction(
+    // Lambda for saving image details to DynamoDB
+    const persistImageDataFn = new lambdanode.NodejsFunction(
       this,
-      "ProcessImage",
+      "PersistImageDataFn",
       {
         runtime: lambda.Runtime.NODEJS_22_X,
-        entry: `${__dirname}/../lambdas/processImage.ts`,
+        entry: `${__dirname}/../lambdas/persistImageData.ts`,
         timeout: cdk.Duration.seconds(15),
         memorySize: 128,
+        environment: {
+          TABLE_NAME: imagesTable.tableName,
+          BUCKET_NAME: imagesBucket.bucketName,
+          REGION: "eu-west-1",
+        },
       }
     );
 
+    // Lambda for sending email notifications
     const mailerFn = new lambdanode.NodejsFunction(this, "mailer", {
       runtime: lambda.Runtime.NODEJS_22_X,
       memorySize: 1024,
@@ -61,37 +80,37 @@ export class EDAAppStack extends cdk.Stack {
       new s3n.SnsDestination(newImageTopic)
     );
 
-    // SNS --> SQS
+    // SNS --> Image processing SQS queue
     newImageTopic.addSubscription(
       new subs.SqsSubscription(imageProcessQueue)
     );
 
+    // SNS --> Mailer SQS queue
     newImageTopic.addSubscription(
       new subs.SqsSubscription(mailerQ)
     );
 
-    // SQS --> Image processing Lambda
-    const newImageEventSource = new events.SqsEventSource(
-      imageProcessQueue,
-      {
+    // Image processing SQS --> DynamoDB Lambda
+    persistImageDataFn.addEventSource(
+      new events.SqsEventSource(imageProcessQueue, {
         batchSize: 5,
         maxBatchingWindow: cdk.Duration.seconds(5),
-      }
+      })
     );
 
-    processImageFn.addEventSource(newImageEventSource);
+    // Mailer SQS --> Mailer Lambda
+    mailerFn.addEventSource(
+      new events.SqsEventSource(mailerQ, {
+        batchSize: 5,
+        maxBatchingWindow: cdk.Duration.seconds(5),
+      })
+    );
 
-    // SQS --> Mailer Lambda
-    const newImageMailEventSource = new events.SqsEventSource(mailerQ, {
-      batchSize: 5,
-      maxBatchingWindow: cdk.Duration.seconds(5),
-    });
+    // Permissions for image persistence
+    imagesBucket.grantRead(persistImageDataFn);
+    imagesTable.grantReadWriteData(persistImageDataFn);
 
-    mailerFn.addEventSource(newImageMailEventSource);
-
-    // Permissions
-    imagesBucket.grantRead(processImageFn);
-
+    // Permissions for sending SES emails
     mailerFn.addToRolePolicy(
       new iam.PolicyStatement({
         effect: iam.Effect.ALLOW,
@@ -104,7 +123,7 @@ export class EDAAppStack extends cdk.Stack {
       })
     );
 
-    // Output
+    // CloudFormation output
     new cdk.CfnOutput(this, "bucketName", {
       value: imagesBucket.bucketName,
     });
