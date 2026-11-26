@@ -11,13 +11,19 @@ const ddbDocClient = createDDbDocClient();
 export const handler: SQSHandler = async (event) => {
   console.log("Event ", JSON.stringify(event));
 
+  const batchItemFailures: { itemIdentifier: string }[] = [];
+
   for (const record of event.Records) {
-    const recordBody = JSON.parse(record.body);
-    const snsMessage = JSON.parse(recordBody.Message);
+    try {
+      const recordBody = JSON.parse(record.body);
+      const snsMessage = JSON.parse(recordBody.Message);
 
-    console.log("Record body ", JSON.stringify(snsMessage));
+      console.log("Record body ", JSON.stringify(snsMessage));
 
-    if (snsMessage.Records) {
+      if (!Array.isArray(snsMessage.Records)) {
+        throw new Error("No S3 records found in SNS message");
+      }
+
       for (const s3Message of snsMessage.Records) {
         const s3e = s3Message.s3;
 
@@ -25,7 +31,7 @@ export const handler: SQSHandler = async (event) => {
           s3e.object.key.replace(/\+/g, " ")
         );
 
-        // Check that the file has a supported image extension
+        // Validate the uploaded file extension
         const extensionMatch = srcKey.match(/\.([^.]*)$/);
         const fileExtension = extensionMatch
           ? extensionMatch[1].toLowerCase()
@@ -36,25 +42,37 @@ export const handler: SQSHandler = async (event) => {
           throw new Error(`Unsupported file type: ${srcKey}`);
         }
 
-        // Save valid image filename to DynamoDB
-        try {
-          await ddbDocClient.send(
-            new PutCommand({
-              TableName: process.env.TABLE_NAME,
-              Item: {
-                name: srcKey,
-              },
-            })
-          );
+        // Save valid image to DynamoDB
+        await ddbDocClient.send(
+          new PutCommand({
+            TableName: process.env.TABLE_NAME,
+            Item: {
+              name: srcKey,
+            },
+          })
+        );
 
-          console.log("Saved image to DynamoDB:", srcKey);
-        } catch (error) {
-          console.log("DynamoDB error:", error);
-          throw error;
-        }
+        console.log("Saved image to DynamoDB:", srcKey);
       }
+    } catch (error) {
+      console.log(
+        "Failed to process SQS record:",
+        record.messageId,
+        error
+      );
+
+      // Report only the failed SQS message
+      batchItemFailures.push({
+        itemIdentifier: record.messageId,
+      });
     }
   }
+
+  console.log("Batch failures:", JSON.stringify(batchItemFailures));
+
+  return {
+    batchItemFailures,
+  };
 };
 
 function createDDbDocClient() {

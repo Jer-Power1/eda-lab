@@ -59,7 +59,7 @@ export class EDAAppStack extends cdk.Stack {
       displayName: "New Image topic",
     });
 
-    // Image persistence Lambda
+    // Lambda for DynamoDB persistence
     const persistImageDataFn = new lambdanode.NodejsFunction(
       this,
       "PersistImageDataFn",
@@ -102,25 +102,26 @@ export class EDAAppStack extends cdk.Stack {
       new s3n.SnsDestination(newImageTopic)
     );
 
-    // SNS --> Image processing queue
+    // SNS --> Image processing SQS queue
     newImageTopic.addSubscription(
       new subs.SqsSubscription(imageProcessQueue)
     );
 
-    // SNS --> Mailer queue
+    // SNS --> Mailer SQS queue
     newImageTopic.addSubscription(
       new subs.SqsSubscription(mailerQ)
     );
 
-    // Image processing queue --> Persistence Lambda
+    // SQS --> Persistence Lambda
     persistImageDataFn.addEventSource(
       new events.SqsEventSource(imageProcessQueue, {
         batchSize: 5,
         maxBatchingWindow: cdk.Duration.seconds(5),
+        reportBatchItemFailures: true,
       })
     );
 
-    // Mailer queue --> Mailer Lambda
+    // SQS --> Mailer Lambda
     mailerFn.addEventSource(
       new events.SqsEventSource(mailerQ, {
         batchSize: 5,
@@ -128,7 +129,7 @@ export class EDAAppStack extends cdk.Stack {
       })
     );
 
-    // DLQ --> Rejected file Lambda
+    // Dead-letter queue --> RejectedFileFn
     rejectedFileFn.addEventSource(
       new events.SqsEventSource(dlq, {
         batchSize: 5,
@@ -136,11 +137,11 @@ export class EDAAppStack extends cdk.Stack {
       })
     );
 
-    // Permissions for image persistence
+    // DynamoDB and S3 permissions
     imagesBucket.grantRead(persistImageDataFn);
     imagesTable.grantReadWriteData(persistImageDataFn);
 
-    // Permissions for sending email
+    // SES permissions
     mailerFn.addToRolePolicy(
       new iam.PolicyStatement({
         effect: iam.Effect.ALLOW,
