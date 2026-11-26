@@ -40,7 +40,7 @@ export class EDAAppStack extends cdk.Stack {
       receiveMessageWaitTime: cdk.Duration.seconds(6),
     });
 
-    // Image processing queue with DLQ
+    // Image processing queue
     const imageProcessQueue = new sqs.Queue(this, "img-process-q", {
       receiveMessageWaitTime: cdk.Duration.seconds(6),
       deadLetterQueue: {
@@ -59,7 +59,7 @@ export class EDAAppStack extends cdk.Stack {
       displayName: "New Image topic",
     });
 
-    // Lambda for DynamoDB persistence
+    // DynamoDB persistence Lambda
     const persistImageDataFn = new lambdanode.NodejsFunction(
       this,
       "PersistImageDataFn",
@@ -96,20 +96,77 @@ export class EDAAppStack extends cdk.Stack {
       }
     );
 
+    // Metadata Lambda
+    const addMetadataFn = new lambdanode.NodejsFunction(
+      this,
+      "addMetadataFn",
+      {
+        runtime: lambda.Runtime.NODEJS_22_X,
+        entry: `${__dirname}/../lambdas/addImageMetadata.ts`,
+        timeout: cdk.Duration.seconds(15),
+        memorySize: 128,
+        environment: {
+          TABLE_NAME: imagesTable.tableName,
+        },
+      }
+    );
+
     // S3 --> SNS
     imagesBucket.addEventNotification(
       s3.EventType.OBJECT_CREATED,
       new s3n.SnsDestination(newImageTopic)
     );
 
-    // SNS --> Image processing SQS queue
+    // SNS --> Image processing queue
+    // Only image upload notifications with supported extensions
     newImageTopic.addSubscription(
-      new subs.SqsSubscription(imageProcessQueue)
+      new subs.SqsSubscription(imageProcessQueue, {
+        filterPolicyWithMessageBody: {
+          Records: sns.FilterOrPolicy.policy({
+            s3: sns.FilterOrPolicy.policy({
+              object: sns.FilterOrPolicy.policy({
+                key: sns.FilterOrPolicy.filter(
+                  sns.SubscriptionFilter.stringFilter({
+                    matchSuffixes: [".jpeg", ".jpg", ".png"],
+                  })
+                ),
+              }),
+            }),
+          }),
+        },
+      })
     );
 
-    // SNS --> Mailer SQS queue
+    // SNS --> Mailer queue
+    // Only image upload notifications with supported extensions
     newImageTopic.addSubscription(
-      new subs.SqsSubscription(mailerQ)
+      new subs.SqsSubscription(mailerQ, {
+        filterPolicyWithMessageBody: {
+          Records: sns.FilterOrPolicy.policy({
+            s3: sns.FilterOrPolicy.policy({
+              object: sns.FilterOrPolicy.policy({
+                key: sns.FilterOrPolicy.filter(
+                  sns.SubscriptionFilter.stringFilter({
+                    matchSuffixes: [".jpeg", ".jpg", ".png"],
+                  })
+                ),
+              }),
+            }),
+          }),
+        },
+      })
+    );
+
+    // SNS --> Metadata Lambda
+    // Only permitted metadata types
+    newImageTopic.addSubscription(
+      new subs.LambdaSubscription(addMetadataFn, {
+        filterPolicy: {
+          metadata_type: sns.SubscriptionFilter.stringFilter({
+            allowlist: ["Caption", "Date", "Photographer"],
+          }),
+        },
+      })
     );
 
     // SQS --> Persistence Lambda
@@ -137,11 +194,11 @@ export class EDAAppStack extends cdk.Stack {
       })
     );
 
-    // DynamoDB and S3 permissions
+    // Permissions
     imagesBucket.grantRead(persistImageDataFn);
     imagesTable.grantReadWriteData(persistImageDataFn);
+    imagesTable.grantReadWriteData(addMetadataFn);
 
-    // SES permissions
     mailerFn.addToRolePolicy(
       new iam.PolicyStatement({
         effect: iam.Effect.ALLOW,
@@ -154,9 +211,13 @@ export class EDAAppStack extends cdk.Stack {
       })
     );
 
-    // CloudFormation output
+    // CloudFormation outputs
     new cdk.CfnOutput(this, "bucketName", {
       value: imagesBucket.bucketName,
+    });
+
+    new cdk.CfnOutput(this, "SNS Topic ARN", {
+      value: newImageTopic.topicArn,
     });
   }
 }
